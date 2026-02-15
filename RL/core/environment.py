@@ -689,71 +689,114 @@ class CoreEnv:
     # ------------------------------
 
     def _consensus_success(self) -> float:
-        """PBFT success probability (paper-aligned P-L model; assume P_n=1).
-
-        We align to the paper's PBFT reliability structure:
-        - Per committee size n_g: f=floor((n_g-1)/3), quorum threshold 2f.
-        - Use paper Eq.(7) to compute average direct transmission success P_l (=P_s).
-        - Use binomial tails (paper Eq.(6)) to compute quorum/commit/system success.
-
-        In this codebase, a "consensus system" corresponds to each governance partition (agent region),
-        so we compute PBFT success per partition and aggregate (size-weighted).
         """
-        part_map = dict(self.partitions) if self.partitions else {}
-        if not part_map:
-            # fallback: treat whole network as one group
-            part_map = {n: 0 for n in self.nodes}
+        Calculates PBFT Consensus Success Probability using Probabilistic Quorum Availability (PQA).
+        
+        Key Improvements:
+        1. Strict PBFT Constraint: Requires a connected cluster of size >= 2f+1.
+           Any component smaller than this cannot sustain consensus (Safety violation).
+        2. Topology Awareness: Uses Dijkstra to calculate actual multi-hop path probabilities 
+           within the Quorum. This correctly penalizes sparse "long chains" (where prob -> 0)
+           and rewards tight, redundant meshes.
+        """
+        N = len(self.nodes)
+        if N < 4: return 0.0 # Min nodes for PBFT (3f+1, f=1 -> N=4)
+        
+        # 1. Calculate PBFT Parameters strictly
+        f = (N - 1) // 3
+        quorum_min = 2 * f + 1
+        
+        # 2. Build Weighted Graph (Weight = -log(P))
+        # Filter weak links (<10%) to optimize search space
+        link_thresh = 0.1
+        adj = {n: [] for n in self.nodes}
+        
+        for (u, v) in self.edges:
+            p = self._link_success(u, v)
+            if p > link_thresh:
+                # -log(p) maps probability product to weight sum
+                # max(1e-9, p) prevents log(0)
+                w = -math.log(max(1e-9, p))
+                adj[u].append((v, w))
+                adj[v].append((u, w))
 
-        # Binomial tail helper (stable enough for n<=200)
-        def _binom_tail(trials: int, p: float, k0: int) -> float:
-            if trials <= 0:
-                return 1.0 if k0 <= 0 else 0.0
-            p = float(max(0.0, min(1.0, p)))
-            k0 = int(max(0, min(trials, k0)))
-            if k0 == 0:
-                return 1.0
-            if p == 0.0:
-                return 0.0
-            if p == 1.0:
-                return 1.0 if k0 <= trials else 0.0
-            s = 0.0
-            for k in range(k0, trials + 1):
-                s += math.comb(trials, k) * (p ** k) * ((1.0 - p) ** (trials - k))
-            return float(max(0.0, min(1.0, s)))
+        # 3. Find Largest Connected Component (LCC)
+        visited = set()
+        max_lcc_nodes = []
+        
+        for node in self.nodes:
+            if node not in visited:
+                component = []
+                stack = [node]
+                visited.add(node)
+                while stack:
+                    curr = stack.pop()
+                    component.append(curr)
+                    for neighbor, _ in adj[curr]:
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            stack.append(neighbor)
+                
+                if len(component) > len(max_lcc_nodes):
+                    max_lcc_nodes = component
+        
+        lcc_size = len(max_lcc_nodes)
+        
+        # 4. Hard Threshold Check (Safety Constraint)
+        # If the largest cluster is smaller than Quorum, consensus is impossible.
+        if lcc_size < quorum_min:
+            # Return a tiny value proportional to size to provide gradient direction
+            # but effectively 0 to indicate failure.
+            return 1e-5 * (lcc_size / quorum_min)
 
-        # Group nodes by partition/agent id
-        groups: Dict[int, List[int]] = {}
-        for n in self.nodes:
-            groups.setdefault(int(part_map.get(n, 0)), []).append(int(n))
+        # 5. Evaluate Quorum Internal Quality (Sampled Path Reliability)
+        # Simulate PBFT phases by checking if random pairs in the Quorum can communicate reliably.
+        
+        n_samples = 30 # Tuning param: higher = less variance, lower = faster
+        # Use time_step in seed to ensure deterministic behavior per step but variation across steps
+        rng = random.Random(self.time_step + 1000) 
+        
+        path_probs = []
+        
+        for _ in range(n_samples):
+            # Sample two distinct nodes from the LCC
+            u, v = rng.sample(max_lcc_nodes, 2)
+            
+            # Dijkstra Algorithm to find the path with Max Probability
+            # Priority Queue stores: (accumulated_weight, current_node)
+            pq = [(0.0, u)]
+            dists = {node: float('inf') for node in max_lcc_nodes}
+            dists[u] = 0.0
+            found_prob = 0.0
+            
+            while pq:
+                d, curr = heapq.heappop(pq)
+                
+                if d > dists[curr]: continue
+                if curr == v:
+                    # Found target! Convert weight -log(p) back to probability p
+                    found_prob = math.exp(-d)
+                    break
+                
+                for neighbor, w in adj[curr]:
+                    # Constrain search strictly within LCC
+                    if neighbor in dists: 
+                        new_dist = d + w
+                        if new_dist < dists[neighbor]:
+                            dists[neighbor] = new_dist
+                            heapq.heappush(pq, (new_dist, neighbor))
+            
+            path_probs.append(found_prob)
 
-        total_weight = 0.0
-        total_p = 0.0
-        for _gid, gnodes in groups.items():
-            n = len(gnodes)
-            if n <= 1:
-                total_p += float(n) * 1.0
-                total_weight += float(n)
-                continue
-
-            # PBFT tolerance for this committee size
-            f = max(0, (n - 1) // 3)
-            k_min = 2 * f
-            need_commit = max(0, n - f)
-
-            # Paper Eq.(7): average direct transmission success probability P_l (=P_s)
-            p_bar = self._paper_avg_link_success(n)
-
-            # Quorum -> node commit -> system commit
-            p_quorum = _binom_tail(n - 1, p_bar, k_min)
-            p_node_commit = float(max(0.0, min(1.0, p_quorum * p_quorum)))
-            p_system = _binom_tail(n, p_node_commit, need_commit)
-
-            total_p += float(n) * float(p_system)
-            total_weight += float(n)
-
-        if total_weight <= 0:
-            return 0.0
-        return float(max(0.0, min(1.0, total_p / total_weight)))
+        # Average reliability of the sampled paths
+        avg_reliability = sum(path_probs) / len(path_probs) if path_probs else 0.0
+        
+        # 6. Final Score Calculation
+        # Base score is the reliability.
+        # We multiply by size ratio to encourage including MORE nodes than just the minimum Quorum.
+        size_ratio = lcc_size / N
+        
+        return avg_reliability * size_ratio
 
     # ------------------------------
     # Paper-aligned wireless helpers
@@ -898,57 +941,84 @@ class CoreEnv:
         return dist[dst]
 
     def _latency_cost(self) -> float:
-        """计算网络平均端到端时延代价。
+        """
+        Calculates Network Latency Cost using Dijkstra Shortest-Delay Path.
         
-        重构后的实现：
-        1. 使用随机采样避免采样偏差（不再用 nodes[:5] 固定切片）
-        2. 使用 Dijkstra 算法计算真实最短时延路径
-        3. 使用合理的归一化因子（期望跳数 * MAX_DELAY）
-        
-        这迫使智能体学会建立高效的中继路由来对抗干扰和长距离通信。
+        Improvements to fix "Normalization Trap":
+        1. Uses Dijkstra to find the actual fastest path, avoiding high-interference links.
+        2. Sets a "Soft Cap" for connected networks (e.g., 0.8) that is strictly less than 
+           the Disconnected Penalty (1.0). This creates a gradient: 
+           Slow Connected (0.8) < Fast Connected (0.1) < Disconnected (1.0).
+        3. Uses a larger denominator for normalization to account for multi-hop accumulation.
         """
         n = len(self.nodes)
-        if n <= 1:
-            return 0.0
+        if n <= 1: return 0.0
         
-        # 连通性检查
+        # 1. Connectivity Check (Hard Penalty)
+        # If the network is partitioned (LCC < Quorum), latency is infinite/undefined.
+        # We align this with the Consensus metric: if consensus fails, latency is max.
+        # However, purely topological connectivity is a faster pre-check.
         if not self._is_connected():
             return 1.0
+
+        # 2. Build Adjacency List with Dynamic Link Delays
+        adj = {node: [] for node in self.nodes}
+        for (src, dst) in self.edges:
+            # Calculate dynamic link delay based on current interference
+            delay = self._link_delay(src, dst)
+            # Prune impossible links to speed up Dijkstra
+            if delay < 10.0: # Arbitrary high cutoff
+                adj[src].append((dst, delay))
+                adj[dst].append((src, delay))
+
+        # 3. Sampled Average Latency
+        # We calculate the average latency of valid paths in the network.
+        n_samples = 30
+        rng = random.Random(self.time_step + 2000) # Different seed offset
         
-        # 随机采样节点对（修复采样偏差）
-        # 采样数量 = max(20, 节点数的 20%)
-        n_samples = max(20, n // 5)
+        total_delay = 0.0
+        valid_samples = 0
+        
         nodes_list = list(self.nodes)
         
-        # 使用当前时间步作为随机种子，确保可重复性但每步不同
-        rng = random.Random(42 + self.time_step)
-        
-        valid_delays: List[float] = []
         for _ in range(n_samples):
-            # 随机选择源和目标（确保全图覆盖）
-            src = rng.choice(nodes_list)
-            dst = rng.choice(nodes_list)
-            if src == dst:
-                continue
+            u, v = rng.sample(nodes_list, 2)
             
-            # 计算最短时延路径
-            delay = self._shortest_delay_path(src, dst)
-            if delay < float('inf'):
-                valid_delays.append(delay)
+            # Dijkstra for Minimum Delay
+            # Priority Queue: (accumulated_delay, current_node)
+            pq = [(0.0, u)]
+            dists = {node: float('inf') for node in self.nodes}
+            dists[u] = 0.0
+            
+            while pq:
+                d, curr = heapq.heappop(pq)
+                if d > dists[curr]: continue
+                if curr == v:
+                    total_delay += d
+                    valid_samples += 1
+                    break
+                
+                for neighbor, link_d in adj[curr]:
+                    new_dist = d + link_d
+                    if new_dist < dists[neighbor]:
+                        dists[neighbor] = new_dist
+                        heapq.heappush(pq, (new_dist, neighbor))
         
-        if not valid_delays:
-            return 1.0
+        if valid_samples == 0: return 1.0
         
-        # 计算平均时延
-        avg_delay = sum(valid_delays) / len(valid_delays)
+        avg_delay = total_delay / valid_samples
         
-        # 归一化：期望跳数 * MAX_DELAY 作为参考
-        # 3.0 代表 PBFT 共识的典型多跳通信期望
-        expected_hops = 3.0
-        max_delay = float(self._phys.get('MAX_DELAY', 1.0))
-        norm = avg_delay / (expected_hops * max_delay)
+        # 4. Normalization with Gradient Preservation
+        # Reference: Expecting e.g. 6 hops * MAX_DELAY per hop
+        # We want to map [0, infinity] to [0, 0.8]
+        max_delay_phys = float(self._phys.get('MAX_DELAY', 1.0))
+        ref_val = 6.0 * max_delay_phys # More loose denominator
         
-        return float(min(1.0, max(0.0, norm)))
+        # Linear scaling clipped at 0.8
+        norm_delay = avg_delay / ref_val
+        
+        # Crucial: Cap at 0.8 so it is distinctly better than Disconnected (1.0)
+        return min(0.8, norm_delay)
     
     def _energy_cost(self) -> float:
         """Energy proxy using TX power * link time for each active edge (bidirectional)."""
@@ -2115,5 +2185,6 @@ class CityGridMobility:
     def _snap(x: float, stride: float) -> float:
         if stride <= 0: return x
         return round(x / stride) * stride
+
 
 
