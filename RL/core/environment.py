@@ -529,6 +529,14 @@ class CoreEnv:
         # === 连通性作为乘法约束 (比加法更严格) ===
         connectivity_multiplier = 1.0 if is_conn else 0.1
         
+        # 7. 边密度惩罚 (基于全连接图比例，惩罚 Full Mesh 趋势)
+        # edge_penalty 基于 1.5*n 目标，对中等超标有效但对极端膨胀（1700 edges）
+        # 惩罚梯度不够陡峭。此项补充一个与绝对密度成正比的惩罚。
+        n_node = len(self.nodes)
+        max_edges = n_node * (n_node - 1)  # undirected: n*(n-1)/2, but edges stored as pairs
+        edge_density = len(self.edges) / max(1, max_edges)
+        edge_density_cost = 0.2 * edge_density
+        
         # === 组合奖励 ===
         reward = (
             # 核心：能量效率 (log scale避免数值问题)
@@ -544,6 +552,30 @@ class CoreEnv:
             # 延迟惩罚
             - 0.6 * latency_cost
         ) * connectivity_multiplier
+        
+        # 边密度惩罚在 connectivity_multiplier 之外施加，
+        # 确保即使断网（multiplier=0.1）也能感知到"边太多"的代价
+        reward -= edge_density_cost
+
+        # ==============================
+        # Difference Rewards (Shapley-inspired per-agent rewards)
+        # ==============================
+        # Solve the "free-rider" problem: agents that contribute nothing to
+        # connectivity get a lower reward, discouraging redundant edges.
+        #
+        # Formula: agent_reward[i] = global_reward + shapley_weight * contribution[i]
+        #
+        # - contribution[i] ∈ [0, 1]: how much LCC drops when agent i is removed
+        # - High contribution → agent is critical → gets bonus
+        # - Zero contribution → agent is fully redundant → gets only global reward
+        #   (which is already penalized by edge_penalty / density_cost)
+        marginal = self._compute_marginal_contributions(partitions)
+        shapley_weight = 1.0  # Tuning param: strength of difference reward
+
+        agent_rewards: Dict[int, float] = {}
+        for aid in set(partitions.values()):
+            contrib = marginal.get(aid, 0.0)
+            agent_rewards[aid] = float(reward) + shapley_weight * contrib
 
         info = {
             # Training loop expects these proxy keys
@@ -560,10 +592,14 @@ class CoreEnv:
             'failure_signal': float(failure_signal),
             'connectivity_multiplier': float(connectivity_multiplier),
             'edge_penalty': float(edge_penalty),
+            'edge_density_cost': float(edge_density_cost),
             'long_edge_cost': float(long_edge_cost),
             'edit_cost': float(edit_cost),
             'edges': len(self.edges),
             'is_connected': bool(is_conn),
+            # Per-agent Difference Rewards (Shapley-inspired)
+            'agent_rewards': agent_rewards,
+            'marginal_contributions': {int(k): float(v) for k, v in marginal.items()},
         }
         obs = self._build_observations(partitions)
         return obs, reward, info
@@ -707,8 +743,11 @@ class CoreEnv:
         quorum_min = 2 * f + 1
         
         # 2. Build Weighted Graph (Weight = -log(P))
-        # Filter weak links (<10%) to optimize search space
-        link_thresh = 0.1
+        # Filter very weak links (<1%) to optimize search space
+        # Note: 0.1 was too aggressive — in high-interference environments,
+        # most links fall below 10%, causing the entire graph to appear
+        # disconnected and driving the agent to blindly add edges.
+        link_thresh = 0.01
         adj = {n: [] for n in self.nodes}
         
         for (u, v) in self.edges:
@@ -1070,6 +1109,92 @@ class CoreEnv:
         return len(visited) == len(self.nodes)
 
     # ------------------------------
+    # Difference Rewards (Shapley-inspired)
+    # ------------------------------
+
+    def _lcc_size(self, adj: Dict[int, Set[int]], node_set: Set[int]) -> int:
+        """Find size of Largest Connected Component restricted to node_set.
+
+        Args:
+            adj: Full adjacency (as sets) — shared across calls for efficiency.
+            node_set: Subset of nodes to consider (others are "masked out").
+
+        Returns:
+            Size of the largest connected component within node_set.
+        """
+        visited: Set[int] = set()
+        max_size = 0
+        for start in node_set:
+            if start in visited:
+                continue
+            size = 0
+            stack = [start]
+            visited.add(start)
+            while stack:
+                curr = stack.pop()
+                size += 1
+                for nb in adj.get(curr, set()):
+                    if nb in node_set and nb not in visited:
+                        visited.add(nb)
+                        stack.append(nb)
+            if size > max_size:
+                max_size = size
+        return max_size
+
+    def _compute_marginal_contributions(
+        self, partitions: Dict[int, int]
+    ) -> Dict[int, float]:
+        """Approximates Shapley Value via Difference Rewards.
+
+        For each agent, calculates how much the LCC size drops when that
+        agent's nodes are removed from the graph.  Uses LCC size as a fast
+        proxy for full PQA (O(m*(V+E)) total, very cheap for m~10, V~100).
+
+        Returns:
+            {agent_id: normalized_contribution} where contribution is in [0, 1].
+            A value near 0 means the agent is fully redundant (removing it
+            does not shrink the LCC).  A high value means the agent is critical
+            for network connectivity.
+        """
+        if not self.nodes or not self.edges:
+            return {}
+
+        # Build adjacency (as sets) once — shared by all counterfactual BFS runs
+        adj: Dict[int, Set[int]] = {n: set() for n in self.nodes}
+        for (u, v) in self.edges:
+            if u in adj and v in adj:
+                adj[u].add(v)
+                adj[v].add(u)
+
+        all_nodes = set(self.nodes)
+        current_lcc = self._lcc_size(adj, all_nodes)
+        N = len(self.nodes)
+
+        # Group nodes by agent
+        agent_nodes: Dict[int, Set[int]] = {}
+        for n, a in partitions.items():
+            if n in all_nodes:
+                agent_nodes.setdefault(a, set()).add(n)
+
+        contributions: Dict[int, float] = {}
+        for aid, nodes_of_agent in agent_nodes.items():
+            # Counterfactual: what happens if this agent's nodes disappear?
+            remaining = all_nodes - nodes_of_agent
+            if not remaining:
+                # This agent owns the entire network
+                contributions[aid] = 1.0
+                continue
+
+            counterfactual_lcc = self._lcc_size(adj, remaining)
+
+            # Raw drop in LCC size
+            drop = current_lcc - counterfactual_lcc
+            # Normalize to [0, 1] by dividing by total node count
+            contributions[aid] = float(max(0.0, drop)) / max(1, N)
+
+        return contributions
+
+    # ------------------------------
     # Link-layer helpers (PBFT-aware)
     # ------------------------------
 
@@ -1114,12 +1239,15 @@ class CoreEnv:
     def _link_success(self, u: int, v: int) -> float:
         """Link success probability for urban street canyon mmWave.
         
-        Uses the CI path loss model with corner loss. The success probability is modeled
-        as the probability that SINR exceeds a threshold z under Rayleigh fading:
-            P(success) = P(SINR > z) = exp(-z / meanSINR)
-        
-        For outage links (PL > cutoff), returns a very small value (not exactly 0 to avoid
-        numerical issues in some downstream code).
+        Fading model is chosen based on LOS/NLOS condition:
+        - NLOS: Rayleigh fading — P(success) = exp(-z / meanSINR).
+          No dominant path; deep fades are common.
+        - LOS:  Rician/AWGN approximation — the dominant direct path stabilizes
+          the signal. We model this as a +6dB effective SINR boost (equivalent
+          to Rician K-factor ~4), so P = exp(-z / (4 * meanSINR)).
+          At typical LOS SINR levels this pushes success close to 1.0,
+          matching real-world mmWave measurements where short LOS links
+          are highly reliable.
         
         Falls back to legacy model if USE_CI_MODEL is False.
         """
@@ -1130,11 +1258,13 @@ class CoreEnv:
         if u not in self.node_pos or v not in self.node_pos:
             return 0.0
         
+        # Retrieve LOS condition from link geometry (cached)
+        _, is_los, _, _ = self._compute_link_geometry(u, v)
+        
         # Compute path loss and check outage
         pl_db, is_outage = self._path_loss_db(u, v)
         
         if is_outage:
-            # Return very small value for outage (not exactly 0)
             return 1e-12
         
         # Convert PL to SINR
@@ -1143,11 +1273,20 @@ class CoreEnv:
         if sinr <= 0.0:
             return 1e-12
         
-        # Rayleigh fading success: P(h > z/sinr) = exp(-z/sinr)
         z = float(self._phys.get('Z', 4.0))
-        expo = -z / max(1e-12, sinr)
-        expo = max(-80.0, min(0.0, expo))
         
+        if is_los:
+            # LOS: Rician/AWGN approximation.
+            # Boost effective SINR by 4x (+6dB) to represent the dominant-path
+            # gain against small-scale fading. This makes short LOS links
+            # (SINR >> Z) approach P ≈ 1.0, matching real mmWave behavior.
+            effective_sinr = sinr * 4.0
+            expo = -z / max(1e-12, effective_sinr)
+        else:
+            # NLOS: Rayleigh fading (original model, no dominant path)
+            expo = -z / max(1e-12, sinr)
+        
+        expo = max(-80.0, min(0.0, expo))
         return float(math.exp(expo))
 
     def _link_success_legacy(self, u: int, v: int) -> float:
@@ -1468,15 +1607,14 @@ class CoreEnv:
         fspl_1m = 32.4 + 20.0 * math.log10(max(1e-3, fc_ghz))
         
         if is_los:
-            # LOS: use Euclidean distance with LOS path loss exponent
+            # LOS: use Euclidean distance with LOS path loss exponent.
+            # No corner loss applied — if the link passes the is_blocked() check
+            # (i.e., no building intersection), the signal has a clear direct path
+            # regardless of road geometry. Corner loss is a diffraction/reflection
+            # penalty that only applies when the signal is physically obstructed.
             n = float(self._phys.get('PL_N_LOS', 1.8))
             d_use = max(1.0, d_euc)  # min 1m to avoid log(0)
             pl_db = fspl_1m + 10.0 * n * math.log10(d_use)
-            
-            # For LOS links that cross roads (n_corner > 0), add a smaller corner penalty
-            # This models the fact that crossing perpendicular streets weakens the signal
-            if n_corner > 0:
-                pl_db += n_corner * corner_loss * 0.5  # 50% of NLOS corner loss
         else:
             # NLOS: use Manhattan/street path distance + full corner loss
             n = float(self._phys.get('PL_N_NLOS', 2.9))
@@ -2185,6 +2323,5 @@ class CityGridMobility:
     def _snap(x: float, stride: float) -> float:
         if stride <= 0: return x
         return round(x / stride) * stride
-
 
 
