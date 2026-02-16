@@ -208,7 +208,29 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
     # History for quick curves
     hist_actor, hist_critic, hist_ret, hist_succ, hist_delay, hist_energy, hist_kl, hist_m, hist_rho, hist_v_rmse, hist_clip = [], [], [], [], [], [], [], [], [], [], []
 
+    # === Curriculum Learning: gradually ramp up INTERF_K ===
+    # Phase 1 (0 ~ warmup_frac): INTERF_K = 0 — agents learn sparse topology without interference
+    # Phase 2 (warmup_frac ~ ramp_end_frac): linear ramp from 0 to target INTERF_K
+    # Phase 3 (ramp_end_frac ~ 1.0): full difficulty
+    _curriculum_target_interf_k = float((cfg.get('physics') or {}).get('INTERF_K', 0.0))
+    _curriculum_warmup_frac = 0.10   # First 10% of episodes: zero interference
+    _curriculum_ramp_end_frac = 0.40  # Ramp completes at 40% of episodes
+
     for ep in range(episodes):
+
+        # --- Curriculum: compute current INTERF_K for this episode ---
+        ep_frac = float(ep) / max(1, episodes)
+        if _curriculum_target_interf_k > 0.0:
+            if ep_frac < _curriculum_warmup_frac:
+                curr_interf_k = 0.0
+            elif ep_frac < _curriculum_ramp_end_frac:
+                ramp_progress = (ep_frac - _curriculum_warmup_frac) / max(1e-6, _curriculum_ramp_end_frac - _curriculum_warmup_frac)
+                curr_interf_k = _curriculum_target_interf_k * ramp_progress
+            else:
+                curr_interf_k = _curriculum_target_interf_k
+            env.set_physics_override('INTERF_K', curr_interf_k)
+            if ep % 50 == 0 and bool((cfg.get('training') or {}).get('verbose', True)):
+                print(f"  [Curriculum] ep={ep} INTERF_K={curr_interf_k:.2f} (target={_curriculum_target_interf_k:.1f})")
 
         episode_idx = ep + 1
         if course_schedule:
