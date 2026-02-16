@@ -362,6 +362,14 @@ class Actor(nn.Module):
             if len(cand_list) == 0:
                 masked_logits_op[op_idx] = float('-inf')
         
+        # === HARD ACTION MASKING: Block ALL add operations when edge budget exceeded ===
+        # This breaks the panic-add positive feedback loop at the source.
+        # When the global edge count exceeds 3*N, agents can ONLY delete or no-op.
+        # The environment sets edge_budget_exceeded=True in the observation.
+        if getattr(obs, 'edge_budget_exceeded', False):
+            masked_logits_op[0] = float('-inf')  # Block internal_add
+            masked_logits_op[2] = float('-inf')  # Block cross_add
+        
         # === 添加操作平衡偏置 ===
         # 当DEL候选较少时，给DEL操作添加正偏置以鼓励探索
         if n_del_cands > 0 and n_add_cands > 0:
