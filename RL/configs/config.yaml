@@ -21,7 +21,7 @@ physics:
   P_NI: 0.1
   # 干扰/噪声随"边密度/并发强度"增加的系数（让拓扑优化真正影响 success/delay/energy）
   # effective_P_NI = P_NI * (1 + INTERF_K * edge_density)
-  INTERF_K: 20.0
+  INTERF_K: 5.0
   PT: 1.0
   ALPHA: 1.7
   Z: 1.0
@@ -96,7 +96,8 @@ training:
   # KL自适应降lr的下限（不要太低，否则无法学习）
   min_lr: 0.0001
   rollout_len: 512
-  epochs: 4
+  epochs: 8
+  minibatch_size: 128
   m_min: 8
   m_max: 32
   m_fixed: 10
@@ -167,7 +168,7 @@ topology_init:
 
 viz:
   enable: true
-  save_every_episodes: 40
+  save_every_episodes: 50
   draw_topology: true
   draw_agent_coverage: true
   max_graph_nodes_for_plot: 400
