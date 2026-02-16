@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import math
+import random as _random
 import torch
 import torch.nn.functional as F
 
@@ -41,7 +42,8 @@ class MAPPOTrainer:
         self.clip_eps = float(tcfg.get('clip', 0.15))
         self.lr = float(tcfg.get('lr', 3e-4))
         self.min_lr = float(tcfg.get('min_lr', 5e-5))
-        self.epochs = int(tcfg.get('epochs', 4))
+        self.epochs = int(tcfg.get('epochs', 8))
+        self.minibatch_size = int(tcfg.get('minibatch_size', 128))
         self.max_grad_norm = 0.5
         
         # === 增强熵正则化 ===
@@ -131,10 +133,11 @@ class MAPPOTrainer:
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self._last_lr
 
         order, adv_t, ret_t = self._compute_gae()
+        n_samples = len(order)
         # Stats for logging (pre-normalization)
         ret_mean = float(ret_t.mean().item())
         ret_std = float(ret_t.std(unbiased=False).item())
-        
+
         # === PopArt: 更新统计量并归一化targets ===
         if hasattr(self.critic, 'update_stats'):
             self.critic.update_stats(ret_t)
@@ -143,129 +146,142 @@ class MAPPOTrainer:
             ret_hat = (ret_t - ret_t.mean()) / (ret_t.std(unbiased=False) + 1e-8)
         else:
             ret_hat = ret_t
-            
-        old_logps = torch.tensor([self.buffer[i].logprob for i in order], dtype=torch.float32)
-        idx_list = [self.buffer[i].idx for i in order]
-        op_list = [self.buffer[i].op for i in order]
 
-        # PPO epochs with adaptive clipping
+        old_logps = torch.tensor([self.buffer[i].logprob for i in order], dtype=torch.float32)
+
+        # PPO epochs with MINIBATCH support
+        # Before: 1 gradient step per epoch (full-batch) → 4 updates total
+        # After:  n_samples/minibatch_size steps per epoch → e.g. 20*8 = 160 updates
         observed_kl = 0.0
         lr_changed = False
-        adaptive_clip = self.clip_eps  # 初始clip值
-        
+        adaptive_clip = self.clip_eps
+        kl_break = False
+        mb = max(16, min(self.minibatch_size, n_samples))
+
+        # Track last-epoch stats for logging (from last minibatch of last epoch)
+        last_actor_loss = torch.tensor(0.0)
+        last_critic_loss = torch.tensor(0.0)
+        last_raw_delta = torch.zeros(1)
+
         for epoch in range(self.epochs):
-            new_logps = []
-            values = []
-            entropies = []
-            
-            # Re-evaluate actor (local) and critic (global)
-            for i in order:
-                tr = self.buffer[i]
-                logp, _, entropy = self.actor.evaluate_logprob_and_value(tr.obs, tr.idx, tr.op, tr.cands, tr.internal_cands, tr.cross_cands)
-                
-                # Centralized Critic call - 使用归一化输出与归一化目标对比
-                # BUG修复：之前使用 forward() 返回反归一化值，但目标是归一化的，量纲不匹配
-                if hasattr(self.critic, 'forward_normalized'):
-                    val_pred = self.critic.forward_normalized(tr.global_state)
+            if kl_break:
+                break
+
+            # Shuffle indices each epoch for stochastic minibatch diversity
+            perm = list(range(n_samples))
+            _random.shuffle(perm)
+
+            for mb_start in range(0, n_samples, mb):
+                mb_end = min(mb_start + mb, n_samples)
+                mb_indices = perm[mb_start:mb_end]
+
+                new_logps = []
+                values = []
+                entropies = []
+
+                for local_idx in mb_indices:
+                    buf_idx = order[local_idx]
+                    tr = self.buffer[buf_idx]
+                    logp, _, entropy = self.actor.evaluate_logprob_and_value(
+                        tr.obs, tr.idx, tr.op, tr.cands,
+                        tr.internal_cands, tr.cross_cands)
+
+                    if hasattr(self.critic, 'forward_normalized'):
+                        val_pred = self.critic.forward_normalized(tr.global_state)
+                    else:
+                        val_pred = self.critic(tr.global_state)
+
+                    new_logps.append(logp)
+                    values.append(val_pred)
+                    entropies.append(entropy)
+
+                new_logps = torch.stack(new_logps).float()
+                values = torch.stack(values).float()
+                entropies = torch.stack(entropies).float()
+                mb_old_logps = old_logps[mb_indices]
+                mb_adv = adv_t[mb_indices]
+                mb_ret_hat = ret_hat[mb_indices]
+
+                # === 动态调整clip范围 ===
+                if epoch > 0 and self.target_kl and observed_kl > 0:
+                    adaptive_clip = self.clip_eps * min(1.0, self.target_kl / (observed_kl + 1e-8))
+                    adaptive_clip = max(0.05, min(self.clip_eps, adaptive_clip))
+
+                ratio = torch.exp(new_logps - mb_old_logps)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - adaptive_clip, 1.0 + adaptive_clip) * mb_adv
+
+                entropy_loss = -self.entropy_coef * torch.mean(entropies)
+                policy_loss = -torch.mean(torch.min(surr1, surr2))
+                actor_loss = policy_loss + entropy_loss
+
+                # Critic loss (Huber-like)
+                v_pred = values.squeeze(-1)
+                raw_delta = v_pred - mb_ret_hat
+                loss_unclipped = raw_delta * raw_delta
+
+                if self.value_clip and self.value_clip > 0:
+                    abs_delta = torch.abs(raw_delta)
+                    loss_huber = torch.where(
+                        abs_delta <= self.value_clip,
+                        loss_unclipped,
+                        self.value_clip * (2 * abs_delta - self.value_clip)
+                    )
+                    critic_loss = torch.mean(loss_huber)
                 else:
-                    val_pred = self.critic(tr.global_state)
-                
-                new_logps.append(logp)
-                values.append(val_pred)
-                entropies.append(entropy)
+                    critic_loss = torch.mean(loss_unclipped)
 
-            new_logps = torch.stack(new_logps).float()
-            values = torch.stack(values).float()
-            entropies = torch.stack(entropies).float()
+                loss = actor_loss + self.value_coef * critic_loss
 
-            # === 动态调整clip范围 ===
-            # 数学原理: ε_adaptive = ε_0 * min(1, KL_target / KL_observed)
-            # 当KL过大时收紧clip，保持Trust Region约束
-            if epoch > 0 and self.target_kl and observed_kl > 0:
-                adaptive_clip = self.clip_eps * min(1.0, self.target_kl / (observed_kl + 1e-8))
-                adaptive_clip = max(0.05, min(self.clip_eps, adaptive_clip))  # 范围 [0.05, clip_eps]
-            
-            ratio = torch.exp(new_logps - old_logps)
-            surr1 = ratio * adv_t
-            surr2 = torch.clamp(ratio, 1.0 - adaptive_clip, 1.0 + adaptive_clip) * adv_t
-            
-            # === 增强熵正则化 ===
-            # 使用更高的熵系数，鼓励探索
-            entropy_loss = -self.entropy_coef * torch.mean(entropies)
-            policy_loss = -torch.mean(torch.min(surr1, surr2))
-            actor_loss = policy_loss + entropy_loss
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters()) + list(self.critic.parameters()),
+                    self.max_grad_norm)
+                self.optimizer.step()
 
-            # Critic loss with PPO-style value clipping
-            # === 关键修复 ===
-            # 之前的实现直接 clamp(v_pred - target)，这会导致被裁剪时梯度为0
-            # 正确的 PPO value clipping 应该使用 max(unclipped_loss, clipped_loss)
-            # 这确保总是有梯度，同时限制值更新幅度
-            v_pred = values.squeeze(-1)
-            target = ret_hat
-            raw_delta = v_pred - target
-            
-            # 计算未裁剪的损失（总是有梯度）
-            loss_unclipped = raw_delta * raw_delta
-            
-            if self.value_clip and self.value_clip > 0:
-                # 裁剪预测值的变化量，而不是裁剪误差
-                # 注意：这里我们没有存储 old_v，所以使用 Huber-like soft clipping
-                # 对于误差 > clip 的部分，使用线性惩罚而非二次（避免梯度消失）
-                abs_delta = torch.abs(raw_delta)
-                # Huber loss: 在 |δ| < clip 时用 MSE，在 |δ| >= clip 时用线性
-                # 这确保梯度永远不为零
-                loss_huber = torch.where(
-                    abs_delta <= self.value_clip,
-                    loss_unclipped,  # MSE for small errors
-                    self.value_clip * (2 * abs_delta - self.value_clip)  # Linear for large errors
-                )
-                critic_loss = torch.mean(loss_huber)
-            else:
-                critic_loss = torch.mean(loss_unclipped)
-            
-            loss = actor_loss + self.value_coef * critic_loss
+                last_actor_loss = actor_loss.detach()
+                last_critic_loss = critic_loss.detach()
+                last_raw_delta = raw_delta.detach()
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()), self.max_grad_norm)
-            self.optimizer.step()
-
-            # KL early stop and optional LR adapt
+            # End-of-epoch KL check (evaluate on full buffer for stable estimate)
             with torch.no_grad():
-                observed_kl = torch.mean(old_logps - new_logps).abs().item()
-            
-            # 使用自适应阈值：1.5x target (比之前的2x更保守)
+                epoch_logps = []
+                for local_idx in range(n_samples):
+                    buf_idx = order[local_idx]
+                    tr = self.buffer[buf_idx]
+                    lp, _, _ = self.actor.evaluate_logprob_and_value(
+                        tr.obs, tr.idx, tr.op, tr.cands,
+                        tr.internal_cands, tr.cross_cands)
+                    epoch_logps.append(lp)
+                epoch_logps = torch.stack(epoch_logps).float()
+                observed_kl = torch.mean(old_logps - epoch_logps).abs().item()
+
             if self.target_kl and observed_kl > 1.5 * self.target_kl:
                 if self.adapt_lr_on_kl:
                     for g in self.optimizer.param_groups:
-                        new_lr = max(float(self.min_lr), g['lr'] * 0.9)  # 更温和的衰减 0.9
+                        new_lr = max(float(self.min_lr), g['lr'] * 0.9)
                         if new_lr < g['lr']:
                             lr_changed = True
                         g['lr'] = new_lr
                         self._last_lr = g['lr']
                     if lr_changed:
                         try:
-                            print(f"[KL EarlyStop] KL={observed_kl:.5f} > {1.5*self.target_kl:.5f}; adaptive_clip={adaptive_clip:.3f}; lr={self._last_lr:.2e}")
+                            print(f"[KL EarlyStop] epoch={epoch} KL={observed_kl:.5f} > "
+                                  f"{1.5*self.target_kl:.5f}; lr={self._last_lr:.2e}")
                         except Exception:
                             pass
-                break
+                kl_break = True
 
-        # KL estimate
-        with torch.no_grad():
-            new_logps_final = []
-            for i in order:
-                tr = self.buffer[i]
-                lp, _, _ = self.actor.evaluate_logprob_and_value(tr.obs, tr.idx, tr.op, tr.cands, tr.internal_cands, tr.cross_cands)
-                new_logps_final.append(lp)
-            new_logps_final = torch.stack(new_logps_final).float()
-            kl = torch.mean(old_logps - new_logps_final).abs().item()
-        
-        # Adaptive LR: increase if KL is in healthy range or too low
+        # Final KL estimate
+        kl = observed_kl  # Already computed at end of last epoch
+
+        # Adaptive LR: increase if KL is in healthy range
         if self.adapt_lr_on_kl and self.target_kl:
             if kl < 1.5 * self.target_kl and self._last_lr < self.lr:
                 for g in self.optimizer.param_groups:
                     if kl < 0.3 * self.target_kl:
-                        factor = 1.2  # 稍慢的恢复
+                        factor = 1.2
                     elif kl < self.target_kl:
                         factor = 1.1
                     else:
@@ -277,25 +293,24 @@ class MAPPOTrainer:
 
         # Clear buffer and reset counters
         self.buffer.clear()
-        
-        # === 记录操作平衡统计后清零 ===
+
         total_ops = self.op_counter['add'] + self.op_counter['del']
         if total_ops > 0:
-            add_ratio = self.op_counter['add'] / total_ops
-            # 可以在这里打印或记录add_ratio用于监控
+            pass  # add_ratio = self.op_counter['add'] / total_ops
         self.op_counter = {'add': 0, 'del': 0}
-        
-        # 计算 RMSE（对于 Huber loss，使用原始 MSE 部分）
+
+        # RMSE from last minibatch (representative)
         with torch.no_grad():
-            mse_for_rmse = torch.mean(raw_delta * raw_delta)
+            mse_for_rmse = torch.mean(last_raw_delta * last_raw_delta)
         loss_v_rmse = float(torch.sqrt(mse_for_rmse).item())
-        
-        # clip_fraction 现在表示使用线性惩罚（而非MSE）的样本比例
+
         clip_fraction = 0.0
         if self.value_clip and self.value_clip > 0:
             with torch.no_grad():
-                clip_fraction = float((torch.abs(raw_delta) >= self.value_clip - 1e-6).float().mean().item())
-        return float(actor_loss.item()), float(critic_loss.item()), float(kl), ret_mean, ret_std, loss_v_rmse, clip_fraction, self._last_lr
+                clip_fraction = float(
+                    (torch.abs(last_raw_delta) >= self.value_clip - 1e-6).float().mean().item())
+        return (float(last_actor_loss.item()), float(last_critic_loss.item()),
+                float(kl), ret_mean, ret_std, loss_v_rmse, clip_fraction, self._last_lr)
 
 
 class EarlyStopper:
