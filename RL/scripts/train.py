@@ -406,7 +406,11 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
                     del warmup_until[a]
 
             done = (t == steps_T - 1)
+            # Use per-agent Difference Rewards when available (Shapley-inspired),
+            # falling back to the global reward for backward compatibility.
+            agent_rewards = info.get('agent_rewards', {})
             for aid, (obs, aux, global_state_t) in aux_store.items():
+                agent_rew = float(agent_rewards.get(aid, reward))
                 trainer.store_transition(
                     agent_id=aid,
                     obs=obs,
@@ -416,7 +420,7 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
                     cands=aux['cands'],
                     logprob=aux['logprob'],
                     value=aux['value'],
-                    reward=float(reward),
+                    reward=agent_rew,
                     done=done,
                     internal_cands=aux.get('internal_cands'),  # Hierarchical action space
                     cross_cands=aux.get('cross_cands'),  # Cross-partition candidates
