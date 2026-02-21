@@ -6,6 +6,8 @@ import random
 import heapq
 from collections import deque
 import numpy as np
+from scipy.sparse import csr_matrix, diags
+from scipy.sparse.csgraph import connected_components, shortest_path
 
 from .data_structures import Observation, Slot, HaloSummary, DeltaE
 from .halo import HaloBuilder
@@ -26,8 +28,8 @@ DEFAULT_PHYSICS = {
     'B': 800.0,                 # Bandwidth (Hz) for Shannon capacity
     'R_A': 0.0,                 # Communication radius (0 = disable)
     'NLOS_ATTEN': 0.25,         # Legacy NLOS attenuation multiplier
-    'MAX_DELAY': 1.0,           # Maximum delay cap (s)
-    'MAX_ENERGY': 200.0,        # Energy normalization constant
+    'MAX_DELAY': 0.05,          # Max delay cap (s), ~50ms for T_slot=1ms scale
+    'MAX_ENERGY': 1.0,          # Energy norm ceiling (J), HARQ Joule-scale
 
     # ========== 3GPP TR 38.901 UMi Street Canyon Channel Model ==========
     'USE_3GPP_MODEL': True,     # Master switch: True = 3GPP, False = legacy
@@ -73,7 +75,7 @@ DEFAULT_PHYSICS = {
 
     # --- BLER Sigmoid Curve (AMC waterfall approximation) ---
     'BLER_K': 1.5,              # Sigmoid steepness
-    'BLER_SINR_THRESH': 6.0,    # 50%-BLER SINR threshold (dB), ~QPSK 1/2
+    'BLER_SINR_THRESH': -5.0,   # 50%-BLER SINR (dB), QPSK 1/8 control-plane
 
     # ========== Kept for backward-compat callers (mapped internally) ==========
     'PL_N_LOS': 2.2,
@@ -135,6 +137,8 @@ class CoreEnv:
         self._link_geo_cache: Dict[Tuple[int, int], Tuple[float, bool, float, int]] = {}
         # Position hash for cache invalidation
         self._pos_hash: int = 0
+        # Vectorized physical cache: Nx2 pos, NxN dist (built per step)
+        self._physical_cache: Dict[str, object] = {}
 
         # Configurable reward weights (updated by curriculum learning)
         default_rw = cfg.get('reward_weights', {}) or {}
@@ -533,18 +537,19 @@ class CoreEnv:
         edge_excess = max(0.0, edge_ratio - 1.0)
         edge_penalty = edge_excess * edge_excess
 
-        # Long-edge penalty
-        if self.edges and self.node_pos:
+        # Long-edge penalty (uses vectorized dist from _physical_cache)
+        if self.edges and self._physical_cache.get('dist_matrix') is not None:
+            dist_matrix = self._physical_cache['dist_matrix']
+            node_to_idx = self._physical_cache['node_to_idx']
             d0 = max(1e-6, float(self._phys.get('D0', 200.0)))
-            d_mean = 0.0
+            d_norm_sum = 0.0
             cnt = 0
-            for (u, v) in self.edges:
-                if u in self.node_pos and v in self.node_pos:
-                    x1, y1 = self.node_pos[u]
-                    x2, y2 = self.node_pos[v]
-                    d_mean += (math.hypot(x1 - x2, y1 - y2) / d0)
+            for u, v in self.edges:
+                iu, iv = node_to_idx.get(u), node_to_idx.get(v)
+                if iu is not None and iv is not None:
+                    d_norm_sum += dist_matrix[iu, iv] / d0
                     cnt += 1
-            d_mean = d_mean / max(1, cnt)
+            d_mean = d_norm_sum / max(1, cnt)
             long_edge_cost = float(min(1.0, max(0.0, (d_mean - 0.5) / 1.0)))
         else:
             long_edge_cost = 0.0
@@ -726,105 +731,161 @@ class CoreEnv:
         return partitions, events
 
     # ------------------------------
+    # SciPy graph helpers (node_id <-> 0..N-1)
+    # ------------------------------
+
+    def _node_idx_map(self) -> Tuple[Dict[int, int], int]:
+        """Return (node_id -> matrix_index, N)."""
+        node_to_idx = {n: i for i, n in enumerate(self.nodes)}
+        return node_to_idx, len(self.nodes)
+
+    def _build_csr_reliability(self, link_thresh: float = 0.01) -> Optional[csr_matrix]:
+        """Build CSR with weight w=-log(p) for edges where p>link_thresh."""
+        if not self.edges:
+            return None
+        node_to_idx, N = self._node_idx_map()
+        rows, cols, data = [], [], []
+        for u, v in self.edges:
+            if u not in node_to_idx or v not in node_to_idx:
+                continue
+            p = self._link_success(u, v)
+            if p <= link_thresh:
+                continue
+            w = -math.log(max(1e-9, p))
+            i, j = node_to_idx[u], node_to_idx[v]
+            rows.extend([i, j])
+            cols.extend([j, i])
+            data.extend([w, w])
+        if not rows:
+            return csr_matrix((N, N))
+        return csr_matrix((data, (rows, cols)), shape=(N, N))
+
+    def _build_csr_delay(self, delay_cap: float = 10.0) -> Optional[csr_matrix]:
+        """Build CSR with weight = _link_delay for edges."""
+        if not self.edges:
+            return None
+        node_to_idx, N = self._node_idx_map()
+        rows, cols, data = [], [], []
+        for u, v in self.edges:
+            if u not in node_to_idx or v not in node_to_idx:
+                continue
+            d = self._link_delay(u, v)
+            if d >= delay_cap:
+                continue
+            i, j = node_to_idx[u], node_to_idx[v]
+            rows.extend([i, j])
+            cols.extend([j, i])
+            data.extend([d, d])
+        if not rows:
+            return csr_matrix((N, N))
+        return csr_matrix((data, (rows, cols)), shape=(N, N))
+
+    def _build_csr_adjacency_binary(self) -> Optional[csr_matrix]:
+        """Build binary CSR (1 for edge) for connectivity."""
+        if not self.edges:
+            return None
+        node_to_idx, N = self._node_idx_map()
+        rows, cols, data = [], [], []
+        for u, v in self.edges:
+            if u not in node_to_idx or v not in node_to_idx:
+                continue
+            i, j = node_to_idx[u], node_to_idx[v]
+            rows.extend([i, j])
+            cols.extend([j, i])
+            data.extend([1.0, 1.0])
+        if not rows:
+            return csr_matrix((N, N))
+        return csr_matrix((data, (rows, cols)), shape=(N, N))
+
+    def _scipy_lcc_nodes(self, adj_csr: csr_matrix) -> Tuple[List[int], np.ndarray]:
+        """Return (list of node_ids in LCC, labels array). Uses node_to_idx inverse."""
+        n_comp, labels = connected_components(csgraph=adj_csr, directed=False)
+        unique, counts = np.unique(labels, return_counts=True)
+        lcc_label = unique[np.argmax(counts)]
+        node_to_idx, N = self._node_idx_map()
+        idx_to_node = [0] * N
+        for nid, idx in node_to_idx.items():
+            idx_to_node[idx] = nid
+        lcc_indices = np.where(labels == lcc_label)[0]
+        lcc_node_ids = [idx_to_node[i] for i in lcc_indices]
+        return lcc_node_ids, labels
+
+    def _scipy_lcc_size_masked(self, adj_csr: csr_matrix, remove_indices: np.ndarray) -> int:
+        """LCC size of graph with given node indices zeroed (removed)."""
+        if remove_indices.size == 0:
+            n_comp, labels = connected_components(csgraph=adj_csr, directed=False)
+            unique, counts = np.unique(labels, return_counts=True)
+            return int(np.max(counts))
+        N = adj_csr.shape[0]
+        mask = np.ones(N)
+        mask[remove_indices] = 0
+        D = diags(mask, format='csr')
+        adj_masked = D @ adj_csr @ D
+        n_comp, labels = connected_components(csgraph=adj_masked, directed=False)
+        unique, counts = np.unique(labels, return_counts=True)
+        return int(np.max(counts)) if counts.size > 0 else 0
+
+    # ------------------------------
     # Enhanced Reward Components
     # ------------------------------
 
     def _consensus_success(self) -> float:
         """Calculates PBFT Consensus Success via PQA with soft LCC guide.
 
-        Score = quorum_factor * (α * reliability_score + β * lcc_ratio)
-
-        Components:
-        1. quorum_factor: sigmoid around 2f+1 (smooth PBFT constraint)
-        2. reliability_score: sampled Dijkstra path reliability within LCC
-        3. lcc_ratio: LCC_size / N  (soft guide — partial credit for growing LCC)
-
-        The soft LCC guide ensures that even when path reliability is near zero
-        (high interference), the agent still gets gradient from expanding the LCC.
+        Uses SciPy for LCC (connected_components) and batch Dijkstra (shortest_path).
         """
         N = len(self.nodes)
         if N < 4:
+            return 0.0
+        if not self.edges:
             return 0.0
 
         f = (N - 1) // 3
         quorum_min = 2 * f + 1
 
-        link_thresh = 0.01
-        adj = {n: [] for n in self.nodes}
+        adj_csr = self._build_csr_reliability(link_thresh=0.01)
+        if adj_csr is None:
+            return 0.0
 
-        for (u, v) in self.edges:
-            p = self._link_success(u, v)
-            if p > link_thresh:
-                w = -math.log(max(1e-9, p))
-                adj[u].append((v, w))
-                adj[v].append((u, w))
-
-        # Find LCC
-        visited = set()
-        max_lcc_nodes = []
-
-        for node in self.nodes:
-            if node not in visited:
-                component = []
-                stack = [node]
-                visited.add(node)
-                while stack:
-                    curr = stack.pop()
-                    component.append(curr)
-                    for neighbor, _ in adj[curr]:
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            stack.append(neighbor)
-                if len(component) > len(max_lcc_nodes):
-                    max_lcc_nodes = component
-
+        max_lcc_nodes, labels = self._scipy_lcc_nodes(adj_csr)
         lcc_size = len(max_lcc_nodes)
 
-        # Smooth quorum proximity factor (sigmoid)
         quorum_ratio = lcc_size / max(1, quorum_min)
         _k_sigmoid = 8.0
         quorum_factor = 1.0 / (1.0 + math.exp(-_k_sigmoid * (quorum_ratio - 1.0)))
-
-        # LCC coverage ratio — always provides gradient
         lcc_ratio = lcc_size / N
 
         if lcc_size < 2:
             return quorum_factor * lcc_ratio * 0.1
 
-        # Sampled path reliability within LCC
-        n_samples = 30
+        node_to_idx, _ = self._node_idx_map()
+        lcc_indices = [node_to_idx[n] for n in max_lcc_nodes if n in node_to_idx]
+        if len(lcc_indices) < 2:
+            return quorum_factor * lcc_ratio * 0.1
+
+        n_sources = 5
         rng = random.Random(self.time_step + 1000)
+        source_indices = rng.sample(lcc_indices, min(n_sources, len(lcc_indices)))
+        dist_matrix = shortest_path(
+            adj_csr, method='D', directed=False, indices=source_indices
+        )
+        if np.ndim(dist_matrix) == 1:
+            dist_matrix = np.reshape(dist_matrix, (1, -1))
+
         path_probs = []
-
+        n_samples = 30
+        inf_val = np.inf
         for _ in range(n_samples):
-            u, v = rng.sample(max_lcc_nodes, 2)
-            pq = [(0.0, u)]
-            dists = {node: float('inf') for node in max_lcc_nodes}
-            dists[u] = 0.0
-            found_prob = 0.0
+            src_i = rng.randrange(dist_matrix.shape[0])
+            dst_i = rng.choice(lcc_indices)
+            d = dist_matrix[src_i, dst_i]
+            if np.isfinite(d) and d < inf_val:
+                path_probs.append(math.exp(-float(d)))
+            else:
+                path_probs.append(0.0)
 
-            while pq:
-                d, curr = heapq.heappop(pq)
-                if d > dists[curr]:
-                    continue
-                if curr == v:
-                    found_prob = math.exp(-d)
-                    break
-                for neighbor, w in adj[curr]:
-                    if neighbor in dists:
-                        new_dist = d + w
-                        if new_dist < dists[neighbor]:
-                            dists[neighbor] = new_dist
-                            heapq.heappush(pq, (new_dist, neighbor))
-
-            path_probs.append(found_prob)
-
-        avg_reliability = sum(path_probs) / len(path_probs) if path_probs else 0.0
-
-        # Weighted combination: 70% reliability + 30% LCC coverage as soft guide
-        # This ensures gradient even when reliability is near-zero
+        avg_reliability = float(np.mean(path_probs)) if path_probs else 0.0
         combined = 0.7 * avg_reliability + 0.3 * lcc_ratio
-
         return combined * quorum_factor
 
     def _algebraic_connectivity(self) -> float:
@@ -1004,82 +1065,53 @@ class CoreEnv:
 
     def _latency_cost(self) -> float:
         """
-        Calculates Network Latency Cost using Dijkstra Shortest-Delay Path.
-        
-        Improvements to fix "Normalization Trap":
-        1. Uses Dijkstra to find the actual fastest path, avoiding high-interference links.
-        2. Sets a "Soft Cap" for connected networks (e.g., 0.8) that is strictly less than 
-           the Disconnected Penalty (1.0). This creates a gradient: 
-           Slow Connected (0.8) < Fast Connected (0.1) < Disconnected (1.0).
-        3. Uses a larger denominator for normalization to account for multi-hop accumulation.
+        Calculates Network Latency Cost using SciPy shortest_path (Dijkstra).
         """
         n = len(self.nodes)
-        if n <= 1: return 0.0
-        
-        # 1. Connectivity Check (Hard Penalty)
-        # If the network is partitioned (LCC < Quorum), latency is infinite/undefined.
-        # We align this with the Consensus metric: if consensus fails, latency is max.
-        # However, purely topological connectivity is a faster pre-check.
+        if n <= 1:
+            return 0.0
+        if not self.edges:
+            return 1.0
+
         if not self._is_connected():
             return 1.0
 
-        # 2. Build Adjacency List with Dynamic Link Delays
-        adj = {node: [] for node in self.nodes}
-        for (src, dst) in self.edges:
-            # Calculate dynamic link delay based on current interference
-            delay = self._link_delay(src, dst)
-            # Prune impossible links to speed up Dijkstra
-            if delay < 10.0: # Arbitrary high cutoff
-                adj[src].append((dst, delay))
-                adj[dst].append((src, delay))
+        adj_csr = self._build_csr_delay(delay_cap=10.0)
+        if adj_csr is None:
+            return 1.0
 
-        # 3. Sampled Average Latency
-        # We calculate the average latency of valid paths in the network.
-        n_samples = 30
-        rng = random.Random(self.time_step + 2000) # Different seed offset
-        
+        n_sources = 5
+        rng = random.Random(self.time_step + 2000)
+        nodes_list = list(self.nodes)
+        node_to_idx, N = self._node_idx_map()
+        source_nodes = rng.sample(nodes_list, min(n_sources, len(nodes_list)))
+        source_indices = [node_to_idx[u] for u in source_nodes if u in node_to_idx]
+
+        dist_matrix = shortest_path(
+            adj_csr, method='D', directed=False, indices=source_indices
+        )
+        if np.ndim(dist_matrix) == 1:
+            dist_matrix = np.reshape(dist_matrix, (1, -1))
+
         total_delay = 0.0
         valid_samples = 0
-        
-        nodes_list = list(self.nodes)
-        
+        n_samples = 30
+        all_indices = list(range(N))
         for _ in range(n_samples):
-            u, v = rng.sample(nodes_list, 2)
-            
-            # Dijkstra for Minimum Delay
-            # Priority Queue: (accumulated_delay, current_node)
-            pq = [(0.0, u)]
-            dists = {node: float('inf') for node in self.nodes}
-            dists[u] = 0.0
-            
-            while pq:
-                d, curr = heapq.heappop(pq)
-                if d > dists[curr]: continue
-                if curr == v:
-                    total_delay += d
-                    valid_samples += 1
-                    break
-                
-                for neighbor, link_d in adj[curr]:
-                    new_dist = d + link_d
-                    if new_dist < dists[neighbor]:
-                        dists[neighbor] = new_dist
-                        heapq.heappush(pq, (new_dist, neighbor))
-        
-        if valid_samples == 0: return 1.0
-        
+            src_i = rng.randrange(dist_matrix.shape[0])
+            dst_i = rng.choice(all_indices)
+            d = dist_matrix[src_i, dst_i]
+            if np.isfinite(d) and d < 1e15:
+                total_delay += float(d)
+                valid_samples += 1
+
+        if valid_samples == 0:
+            return 1.0
+
         avg_delay = total_delay / valid_samples
-        
-        # 4. Normalization with Gradient Preservation
-        # Reference: Expecting e.g. 6 hops * MAX_DELAY per hop
-        # We want to map [0, infinity] to [0, 0.8]
-        max_delay_phys = float(self._phys.get('MAX_DELAY', 1.0))
-        ref_val = 6.0 * max_delay_phys # More loose denominator
-        
-        # Linear scaling clipped at 0.8
+        max_delay_phys = float(self._phys.get('MAX_DELAY', 0.05))
+        ref_val = 6.0 * max_delay_phys
         norm_delay = avg_delay / ref_val
-        
-        # Crucial: Cap at 0.8 so it is distinctly better than Disconnected (1.0)
         return min(0.8, norm_delay)
     
     def _energy_cost(self) -> float:
@@ -1119,117 +1151,63 @@ class CoreEnv:
         return 1.0 if self._is_connected() else 0.0
     
     def _is_connected(self) -> bool:
-        """Check if the graph is connected using BFS."""
+        """Check if the graph is connected using SciPy connected_components."""
         if len(self.nodes) <= 1:
             return True
-        
         if not self.edges:
             return len(self.nodes) <= 1
-        
-        # Build adjacency list
-        adj: Dict[int, List[int]] = {n: [] for n in self.nodes}
-        for u, v in self.edges:
-            if u not in adj or v not in adj:
-                continue
-            adj[u].append(v)
-            adj[v].append(u)
-        
-        # BFS from first node
-        visited = set()
-        queue = [self.nodes[0]]
-        visited.add(self.nodes[0])
-        
-        while queue:
-            node = queue.pop(0)
-            for neighbor in adj[node]:
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    queue.append(neighbor)
-        
-        return len(visited) == len(self.nodes)
+
+        adj_csr = self._build_csr_adjacency_binary()
+        if adj_csr is None:
+            return False
+        n_comp, _ = connected_components(csgraph=adj_csr, directed=False)
+        return int(n_comp) <= 1
 
     # ------------------------------
     # Difference Rewards (Shapley-inspired)
     # ------------------------------
 
     def _lcc_size(self, adj: Dict[int, Set[int]], node_set: Set[int]) -> int:
-        """Find size of Largest Connected Component restricted to node_set.
-
-        Args:
-            adj: Full adjacency (as sets) — shared across calls for efficiency.
-            node_set: Subset of nodes to consider (others are "masked out").
-
-        Returns:
-            Size of the largest connected component within node_set.
-        """
-        visited: Set[int] = set()
-        max_size = 0
-        for start in node_set:
-            if start in visited:
-                continue
-            size = 0
-            stack = [start]
-            visited.add(start)
-            while stack:
-                curr = stack.pop()
-                size += 1
-                for nb in adj.get(curr, set()):
-                    if nb in node_set and nb not in visited:
-                        visited.add(nb)
-                        stack.append(nb)
-            if size > max_size:
-                max_size = size
-        return max_size
+        """Legacy: Find LCC size restricted to node_set. Prefer _scipy_lcc_size_masked."""
+        if not adj or not node_set:
+            return 0
+        adj_csr = self._build_csr_adjacency_binary()
+        if adj_csr is None:
+            return 0
+        node_to_idx, N = self._node_idx_map()
+        remove_indices = np.array([node_to_idx[n] for n in self.nodes if n not in node_set], dtype=np.intp)
+        return self._scipy_lcc_size_masked(adj_csr, remove_indices)
 
     def _compute_marginal_contributions(
         self, partitions: Dict[int, int]
     ) -> Dict[int, float]:
-        """Approximates Shapley Value via Difference Rewards.
-
-        For each agent, calculates how much the LCC size drops when that
-        agent's nodes are removed from the graph.  Uses LCC size as a fast
-        proxy for full PQA (O(m*(V+E)) total, very cheap for m~10, V~100).
-
-        Returns:
-            {agent_id: normalized_contribution} where contribution is in [0, 1].
-            A value near 0 means the agent is fully redundant (removing it
-            does not shrink the LCC).  A high value means the agent is critical
-            for network connectivity.
-        """
+        """Approximates Shapley Value via Difference Rewards. Uses SciPy connected_components."""
         if not self.nodes or not self.edges:
             return {}
 
-        # Build adjacency (as sets) once — shared by all counterfactual BFS runs
-        adj: Dict[int, Set[int]] = {n: set() for n in self.nodes}
-        for (u, v) in self.edges:
-            if u in adj and v in adj:
-                adj[u].add(v)
-                adj[v].add(u)
+        adj_csr = self._build_csr_adjacency_binary()
+        if adj_csr is None:
+            return {}
 
-        all_nodes = set(self.nodes)
-        current_lcc = self._lcc_size(adj, all_nodes)
-        N = len(self.nodes)
+        node_to_idx, N = self._node_idx_map()
+        remove_indices_empty = np.array([], dtype=np.intp)
+        current_lcc = self._scipy_lcc_size_masked(adj_csr, remove_indices_empty)
 
-        # Group nodes by agent
-        agent_nodes: Dict[int, Set[int]] = {}
+        agent_nodes: Dict[int, List[int]] = {}
         for n, a in partitions.items():
-            if n in all_nodes:
-                agent_nodes.setdefault(a, set()).add(n)
+            if n in node_to_idx:
+                agent_nodes.setdefault(a, []).append(n)
 
         contributions: Dict[int, float] = {}
         for aid, nodes_of_agent in agent_nodes.items():
-            # Counterfactual: what happens if this agent's nodes disappear?
-            remaining = all_nodes - nodes_of_agent
-            if not remaining:
-                # This agent owns the entire network
+            if not nodes_of_agent:
+                continue
+            remove_idx = np.array([node_to_idx[n] for n in nodes_of_agent if n in node_to_idx], dtype=np.intp)
+            if remove_idx.size == N:
                 contributions[aid] = 1.0
                 continue
-
-            counterfactual_lcc = self._lcc_size(adj, remaining)
-
-            # Raw drop in LCC size
+            counterfactual_lcc = self._scipy_lcc_size_masked(adj_csr, remove_idx)
             drop = current_lcc - counterfactual_lcc
-            # Normalize to [0, 1] by dividing by total node count
             contributions[aid] = float(max(0.0, drop)) / max(1, N)
 
         return contributions
@@ -1340,7 +1318,7 @@ class CoreEnv:
         BLER = 1 / (1 + exp(k * (SINR_dB - SINR_thresh)))
         """
         k = float(self._phys.get('BLER_K', 1.5))
-        sinr_thresh = float(self._phys.get('BLER_SINR_THRESH', 6.0))
+        sinr_thresh = float(self._phys.get('BLER_SINR_THRESH', -5.0))
         x = k * (sinr_db - sinr_thresh)
         x = max(-30.0, min(30.0, x))
         return 1.0 / (1.0 + math.exp(x))
@@ -1371,6 +1349,25 @@ class CoreEnv:
 
     # ------------------------------------------------------------------
 
+    def _build_physical_cache(self) -> None:
+        """Build vectorized pos array (Nx2) and distance matrix (NxN)."""
+        if not self.nodes or not self.node_pos:
+            self._physical_cache.clear()
+            return
+        node_to_idx, N = self._node_idx_map()
+        pos_arr = np.zeros((N, 2), dtype=np.float64)
+        for nid, idx in node_to_idx.items():
+            p = self.node_pos.get(nid, (0.0, 0.0))
+            pos_arr[idx, 0] = float(p[0])
+            pos_arr[idx, 1] = float(p[1])
+        dx = pos_arr[:, 0:1] - pos_arr[:, 0:1].T
+        dy = pos_arr[:, 1:2] - pos_arr[:, 1:2].T
+        dist_matrix = np.sqrt(dx * dx + dy * dy)
+        np.fill_diagonal(dist_matrix, 0.0)
+        self._physical_cache['pos_arr'] = pos_arr
+        self._physical_cache['dist_matrix'] = dist_matrix
+        self._physical_cache['node_to_idx'] = node_to_idx
+
     def _build_step_link_cache(self) -> None:
         """Compute and cache per-edge link metrics for the current time step.
 
@@ -1381,6 +1378,9 @@ class CoreEnv:
         ``_link_delay``, ``_link_snr``, and ``_energy_cost`` can all
         read pre-computed values without redundant log/exp operations.
         """
+        # 0. Vectorized physical cache (Nx2 pos, NxN dist) for reward/geometry
+        self._build_physical_cache()
+
         # 1. Compute node degrees (undirected → each edge contributes +1 to both ends)
         deg: Dict[int, int] = {n: 0 for n in self.nodes}
         for u, v in self.edges:
