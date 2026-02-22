@@ -167,13 +167,23 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
     msg_cfg = cfg.get('messaging', {}) or {}
     bus = MessageBus(dim=int(cfg['model']['msg_dim']), ttl=int(msg_cfg.get('ttl', 3)), dropout=float(msg_cfg.get('dropout', 0.2)))
 
+    tcfg = cfg.get('training', {}) or {}
+    force_cpu = bool(tcfg.get('force_cpu', False))
+    device = torch.device('cpu' if force_cpu or not torch.cuda.is_available() else 'cuda')
+    if torch.cuda.is_available() and not force_cpu:
+        print(f"[Device] Using: {device} ({torch.cuda.get_device_name(0)})")
+    else:
+        print(f"[Device] Using: {device}")
+    if force_cpu and torch.cuda.is_available():
+        print("[Device] force_cpu=true in config, running on CPU despite CUDA availability")
+
     actor = Actor(cfg)
-    # Critic with global context awareness (6 extra features from env)
-    GLOBAL_CONTEXT_DIM = 6
-    base_critic = Critic(input_dim=128, context_dim=GLOBAL_CONTEXT_DIM)
+    critic = Critic(input_dim=128, context_dim=6)
     loss_cfg = cfg.get('loss', {}) or {}
     popart_beta = float(loss_cfg.get('popart_beta', 0.0003))
-    critic = PopArtCritic(base_critic, beta=popart_beta)
+    critic = PopArtCritic(critic, beta=popart_beta)
+    actor = actor.to(device)
+    critic = critic.to(device)
     trainer = MAPPOTrainer(actor, critic, cfg)
 
     tcfg = (cfg.get('training') or {})
@@ -220,7 +230,7 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
     checkpoint_every = int(tcfg.get('checkpoint_interval_episodes', 100))
 
     # History for quick curves
-    hist_actor, hist_critic, hist_ret, hist_succ, hist_delay, hist_energy, hist_kl, hist_m, hist_rho, hist_v_rmse, hist_clip = [], [], [], [], [], [], [], [], [], [], []
+    hist_actor, hist_critic, hist_ret, hist_succ, hist_delay, hist_energy, hist_kl, hist_m, hist_rho, hist_v_rmse, hist_clip, hist_edges = [], [], [], [], [], [], [], [], [], [], [], []
 
     # Curriculum is now fully driven by course_schedule in config.yaml.
     # The old hardcoded INTERF_K ramp is removed. See course_schedule
@@ -325,21 +335,18 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
             obs_by_agent = build_observations(env, partitions, bus, role_ids, cfg)
             # Extract agent features for Global State (CTDE)
             active_agents = sorted(obs_by_agent.keys())
-            global_feats = []
 
             with torch.no_grad():
-                for aid in active_agents:
-                    z = actor.embed_obs(obs_by_agent[aid])
-                    global_feats.append(z)
-
-            if global_feats:
-                global_state_t = torch.stack(global_feats, dim=0).unsqueeze(0)
-            else:
-                global_state_t = torch.zeros(1, 1, 128)
+                if active_agents:
+                    obs_list = [obs_by_agent[aid] for aid in active_agents]
+                    global_feats = actor.embed_obs_batch(obs_list)  # [A, 128]
+                    global_state_t = global_feats.unsqueeze(0)       # [1, A, 128]
+                else:
+                    global_state_t = torch.zeros(1, 1, 128, device=device)
 
             # Global context for Critic awareness
             global_ctx_list = env.compute_global_context()
-            global_ctx_t = torch.tensor(global_ctx_list, dtype=torch.float32).unsqueeze(0)  # [1, 6]
+            global_ctx_t = torch.tensor(global_ctx_list, dtype=torch.float32, device=device).unsqueeze(0)  # [1, 6]
 
             actions = {}
             aux_store = {}
@@ -442,6 +449,7 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
         hist_actor.append(a_loss); hist_critic.append(c_loss); hist_ret.append(avg_return/max(1,steps_T));
         hist_succ.append(success_p/max(1,steps_T)); hist_delay.append(delay_p/max(1,steps_T)); hist_energy.append(energy_p/max(1,steps_T))
         hist_kl.append(kl); hist_m.append(m); hist_rho.append(len(env.nodes)/max(1,m*int((cfg.get('autoscale') or {}).get('target_slots_per_agent',10)))); hist_v_rmse.append(v_rmse); hist_clip.append(clip_frac)
+        hist_edges.append(len(env.edges))
         # Metrics to CSV
         if csv_writer:
             steps = max(1, steps_T)
@@ -484,6 +492,7 @@ def run(cfg_path: str | None = None, overrides: dict | None = None):
                 _save_curve(hist_m, 'm')
                 _save_curve(hist_rho, 'rho_bar')
                 _save_curve(hist_clip, 'value_clip_frac')
+                _save_curve(hist_edges, 'edges')
                 # combined m & rho plot for convenience
                 _plt.figure(figsize=(6,3))
                 _plt.plot(hist_m, label='m')
