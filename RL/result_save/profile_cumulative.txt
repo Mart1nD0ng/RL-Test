@@ -1,0 +1,58 @@
+         33858701 function calls (32960389 primitive calls) in 100.371 seconds
+
+   Ordered by: cumulative time
+   List reduced from 705 to 50 due to restriction <50>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.083    0.083  100.523  100.523 C:\Users\Martin\Desktop\RL-Test-main\RL\scripts\profile_timing.py:122(run_one_episode_profiled)
+        1    0.817    0.817   86.691   86.691 C:\Users\Martin\Desktop\RL-Test-main\RL\training\mappo_trainer.py:133(update)
+     5120    0.504    0.000   38.457    0.008 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:730(evaluate_logprob_and_value)
+       40    0.000    0.000   33.460    0.837 C:\Users\Martin\anaconda3\Lib\site-packages\torch\_tensor.py:575(backward)
+       40    0.001    0.000   33.460    0.837 C:\Users\Martin\anaconda3\Lib\site-packages\torch\autograd\__init__.py:252(backward)
+       40    0.000    0.000   33.457    0.836 C:\Users\Martin\anaconda3\Lib\site-packages\torch\autograd\graph.py:856(_engine_run_backward)
+       40   33.457    0.836   33.457    0.836 {method 'run_backward' of 'torch._C._EngineBase' objects}
+     6400    0.235    0.000   29.836    0.005 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:319(_gnn_forward)
+503656/80790    0.751    0.000   29.827    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\modules\module.py:1772(_wrapped_call_impl)
+503656/80790    1.091    0.000   29.686    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\modules\module.py:1780(_call_impl)
+    52694    0.203    0.000   13.560    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\modules\container.py:248(forward)
+     6400   11.255    0.002   13.403    0.002 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:243(_build_edge_features)
+     5184    0.080    0.000   13.392    0.003 C:\Users\Martin\Desktop\RL-Test-main\RL\models\critic.py:113(forward)
+     5120    0.014    0.000   13.290    0.003 C:\Users\Martin\Desktop\RL-Test-main\RL\models\critic.py:168(forward_normalized)
+    25920    1.507    0.000   11.677    0.000 C:\Users\Martin\Desktop\RL-Test-main\RL\models\critic.py:22(forward)
+    12800    4.320    0.000   11.009    0.001 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:45(forward)
+    10368    0.048    0.000   10.282    0.001 C:\Users\Martin\Desktop\RL-Test-main\RL\models\critic.py:56(forward)
+   254332    0.250    0.000    8.604    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\modules\linear.py:130(forward)
+   254332    8.165    0.000    8.165    0.000 {built-in method torch._C._nn.linear}
+     5760    4.029    0.001    6.356    0.001 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:463(_candidates)
+      720    0.015    0.000    5.665    0.008 C:\Users\Martin\anaconda3\Lib\site-packages\torch\utils\_contextlib.py:120(decorate_context)
+      640    0.069    0.000    5.637    0.009 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:614(act)
+      640    0.040    0.000    5.015    0.008 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:562(compute_logits)
+     5760    0.316    0.000    3.560    0.001 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:364(_lstm_forward)
+       64    0.058    0.001    3.051    0.048 C:\Users\Martin\Desktop\RL-Test-main\RL\core\environment.py:474(step)
+      640    0.024    0.000    3.022    0.005 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:338(embed_obs)
+     6400    2.199    0.000    2.533    0.000 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:230(_adjacency_from_obs)
+     5184    0.016    0.000    2.377    0.000 C:\Users\Martin\Desktop\RL-Test-main\RL\models\critic.py:68(forward)
+      129    0.458    0.004    2.319    0.018 C:\Users\Martin\Desktop\RL-Test-main\RL\core\environment.py:2050(_build_observations)
+     7680    0.320    0.000    2.135    0.000 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:400(_score_candidates)
+    77440    0.110    0.000    2.056    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\modules\normalization.py:228(forward)
+   103680    0.493    0.000    1.899    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\_tensor.py:1051(split)
+    77440    0.155    0.000    1.887    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\functional.py:2914(layer_norm)
+     5760    0.099    0.000    1.746    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\modules\rnn.py:1059(forward)
+    77440    1.666    0.000    1.666    0.000 {built-in method torch.layer_norm}
+    11520    0.185    0.000    1.629    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\distributions\categorical.py:150(log_prob)
+   117986    1.598    0.000    1.598    0.000 {built-in method torch.cat}
+    11520    0.184    0.000    1.527    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\distributions\categorical.py:57(__init__)
+     5760    1.433    0.000    1.433    0.000 {built-in method torch.lstm}
+   105430    0.091    0.000    1.272    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\nn\functional.py:1710(relu)
+   103680    1.246    0.000    1.246    0.000 {built-in method torch.split}
+     1290    0.191    0.000    1.218    0.001 C:\Users\Martin\Desktop\RL-Test-main\RL\core\halo.py:81(build_for_partition)
+    11520    0.139    0.000    1.213    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\distributions\distribution.py:47(__init__)
+       64    0.001    0.000    1.205    0.019 C:\Users\Martin\Desktop\RL-Test-main\RL\training\rollout.py:23(build_observations)
+    12800    1.192    0.000    1.192    0.000 {built-in method torch.sigmoid}
+   105430    1.157    0.000    1.157    0.000 {built-in method torch.relu}
+     6400    0.563    0.000    0.930    0.000 C:\Users\Martin\Desktop\RL-Test-main\RL\models\actor.py:207(_node_features)
+    11520    0.610    0.000    0.893    0.000 C:\Users\Martin\anaconda3\Lib\site-packages\torch\distributions\constraints.py:520(check)
+  3068714    0.811    0.000    0.864    0.000 {built-in method builtins.sorted}
+   224102    0.808    0.000    0.808    0.000 {method 'unsqueeze' of 'torch._C.TensorBase' objects}
+
+
